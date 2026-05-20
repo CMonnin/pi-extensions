@@ -87,6 +87,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, _ctx) => {
     planMode = pi.getFlag("plan");
     if (planMode) {
+      console.log("[plan-mode] Plan mode activated");
       pi.setActiveTools(Array.from(READ_ONLY_TOOLS));
       _ctx.ui?.notify("Plan mode enabled — read-only, no execution", "info");
     }
