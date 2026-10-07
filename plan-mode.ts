@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // Tools allowed in plan mode. Everything else (write, edit, powershell,
 // codemode, MCP and other extension tools) is blocked, so new write-capable
 // tools are denied by default instead of slipping through.
-const ALLOWED_TOOLS = new Set(["read", "grep", "find", "ls", "bash"]);
+const ALLOWED_TOOLS = new Set(["read", "grep", "find", "ls", "bash", "Skill"]);
 
 // Read-only commands allowed as a pipeline segment. Matched on the first word.
 const ALLOWED_COMMANDS = new Set([
