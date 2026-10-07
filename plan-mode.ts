@@ -1,40 +1,59 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-// Bash commands allowed in plan mode (read-only operations)
-const ALLOWED_BASH = [
-  "cat ", "head ", "tail ", "wc ", "diff ", "git log", "git status",
-  "git diff", "git show", "git branch", "git remote", "git diff",
-  "tree", "file ", "stat ", "uname", "env", "echo ",
-  "grep ", "find ", "ls ", "pwd", "which ", "command -v",
-  "df ", "du ", "ps ", "top", "htop",
-  "curl ", "wget --spider",
-  "python -c", "node -e", "jq ",
-];
+// Tools allowed in plan mode. Everything else (write, edit, powershell,
+// codemode, MCP and other extension tools) is blocked, so new write-capable
+// tools are denied by default instead of slipping through.
+const ALLOWED_TOOLS = new Set(["read", "grep", "find", "ls", "bash"]);
 
-// Patterns that indicate a write/modify operation
-const WRITE_PATTERNS = [
-  "^rm\\b", "^rmdir", "^mv\\b", "^cp\\b", "^chmod", "^chown",
-  "^mkdir", "^touch\\b", "^dd\\b", "^truncate",
-  "sed -i", "\\|\\s*tee",
-  "apt\\b", "yum\\b", "pip install", "npm install", "pnpm install", "bun install",
-  "git commit", "git push", "git checkout", "git merge", "git rebase",
-];
+// Read-only commands allowed as a pipeline segment. Matched on the first word.
+const ALLOWED_COMMANDS = new Set([
+  "cat", "head", "tail", "wc", "diff", "tree", "file", "stat", "uname",
+  "echo", "grep", "rg", "find", "fd", "ls", "pwd", "which", "df", "du", "ps",
+  "jq", "sort", "uniq", "cut", "basename", "dirname", "realpath", "git",
+]);
 
-function isWriteCommand(cmd: string): boolean {
-  const line = cmd.trim().split("\n")[0].trim();
-  return WRITE_PATTERNS.some((p) => {
-    try { return new RegExp(p, "i").test(line); }
-    catch { return line.toLowerCase().includes(p.toLowerCase()); }
-  });
+// Read-only git subcommands. branch/remote only without arguments that modify.
+const ALLOWED_GIT = new Set(["log", "status", "diff", "show", "branch", "remote"]);
+const GIT_READ_ONLY_ARGS: Record<string, RegExp> = {
+  branch: /^(-a|-r|-v|-vv|--list|--all|--remotes|--show-current)$/,
+  remote: /^(-v|--verbose)$/,
+};
+
+// Shell syntax that can write files, chain commands or run arbitrary code.
+// Pipes are handled separately: each segment must itself be allowed.
+const FORBIDDEN_SYNTAX = /[;&><`\n]|\$\(|\|\|/;
+
+// Per-command arguments that make an otherwise read-only command write files
+// or run other programs.
+const FORBIDDEN_ARGS: Record<string, RegExp> = {
+  find: /^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/,
+  fd: /^(-x|-X|--exec|--exec-batch)(=|$)/,
+  rg: /^--pre(=|$)/,
+  sort: /^(-o\S*|--output(=.*)?)$/,
+  git: /^--output(=|$)/,
+};
+
+function isAllowedSegment(segment: string): boolean {
+  const words = segment.trim().split(/\s+/);
+  const [cmd, sub, ...rest] = words;
+  if (!cmd || !ALLOWED_COMMANDS.has(cmd)) return false;
+  const forbidden = FORBIDDEN_ARGS[cmd];
+  if (forbidden && words.slice(1).some((arg) => forbidden.test(arg))) return false;
+  if (cmd === "git") {
+    if (!sub || !ALLOWED_GIT.has(sub)) return false;
+    const argPattern = GIT_READ_ONLY_ARGS[sub];
+    if (argPattern && !rest.every((arg) => argPattern.test(arg))) return false;
+  }
+  return true;
 }
 
-function isAllowedBash(cmd: string): boolean {
-  const line = cmd.trim().split("\n")[0].trim();
-  return ALLOWED_BASH.some((p) => line.toLowerCase().startsWith(p.toLowerCase()));
+function isAllowedBash(command: string): boolean {
+  const cmd = command.trim();
+  if (!cmd || FORBIDDEN_SYNTAX.test(cmd)) return false;
+  return cmd.split("|").every(isAllowedSegment);
 }
 
 const PLAN_INSTRUCTIONS = `
----
 PLAN MODE — Read-only. Do NOT execute any changes.
 
 Produce a structured plan in this format:
@@ -57,7 +76,9 @@ Produce a structured plan in this format:
 ## Risks
 [Caveats, edge cases, things to verify]
 
-Only use read, grep, find, ls to gather info. Do NOT call write, edit, or bash to make changes.
+Only use read, grep, find, ls, and simple read-only bash commands (no redirection,
+chaining, or command substitution) to gather info. Do NOT call write, edit, or any
+other tool that makes changes.
 `.trim();
 
 export default function (pi: ExtensionAPI) {
@@ -91,26 +112,33 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Inject planning instructions
+  // Inject planning instructions as a prompt section rather than replacing the
+  // whole system prompt, so Pi records a delta and keeps the cached prefix.
   pi.on("before_agent_start", async (event, _ctx) => {
-    if (!planMode) return;
-    return {
-      systemPrompt: event.systemPrompt + "\n\n" + PLAN_INSTRUCTIONS,
-    };
+    if (planMode) {
+      event.systemPromptOptions.sections.plan_mode = PLAN_INSTRUCTIONS;
+    } else {
+      delete event.systemPromptOptions.sections.plan_mode;
+    }
   });
 
-  // Block write operations
+  // Block anything that is not explicitly read-only
   pi.on("tool_call", async (event, _ctx) => {
     if (!planMode) return;
 
-    if (event.toolName === "write" || event.toolName === "edit") {
-      return { block: true, reason: "Plan mode: write tools disabled" };
+    if (!ALLOWED_TOOLS.has(event.toolName)) {
+      return { block: true, reason: `Plan mode: ${event.toolName} is disabled` };
     }
 
     if (event.toolName === "bash") {
       const cmd = (event.input as { command?: string }).command ?? "";
-      if (isWriteCommand(cmd) && !isAllowedBash(cmd)) {
-        return { block: true, reason: "Plan mode: write commands blocked" };
+      if (!isAllowedBash(cmd)) {
+        return {
+          block: true,
+          reason:
+            "Plan mode: only simple read-only commands are allowed " +
+            "(no redirection, chaining, or command substitution)",
+        };
       }
     }
   });
